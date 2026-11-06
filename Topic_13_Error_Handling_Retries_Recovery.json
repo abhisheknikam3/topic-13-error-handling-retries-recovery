@@ -1,0 +1,407 @@
+{
+  "name": "Topic 13 - Error Handling, Retries & Recovery Strategies",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "e9a10001-0001-4000-8000-000000000001",
+      "name": "Manual_Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        200,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [\n  {\n    json: {\n      transactionId: \"TX-CRASH-801\",\n      customerEmail: \"vip-client@enterprise.org\",\n      amount: 1450.00,\n      simulateFault: \"GATEWAY_TIMEOUT_504\",\n      statusCode: 504\n    }\n  }\n];"
+      },
+      "id": "e9a10001-0002-4000-8000-000000000002",
+      "name": "Code_SimulateFailingOrder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://httpstat.us/504",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "e9a10001-0003-4000-8000-000000000003",
+      "name": "HTTP_FlakyPaymentGateway",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        640,
+        220
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {},
+      "id": "e9a10001-0004-4000-8000-000000000004",
+      "name": "Error_Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        200,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const errorContext = $input.first().json;\nconst execution = errorContext.execution || {};\nconst lastNode = execution.error?.node || {};\nconst failedItem = lastNode.runIndex !== undefined \n  ? execution.data?.resultData?.runData?.[lastNode.name]?.[0]?.data?.main?.[0]?.[0]?.json \n  : { transactionId: \"TX-CRASH-801\", customerEmail: \"vip-client@enterprise.org\", amount: 1450.00 };\n\nconst statusCode = execution.error?.statusCode || 504;\nconst isTransient = [502, 503, 504, 429].includes(statusCode);\n\nreturn [{\n  json: {\n    incidentId: \"INC-\" + Math.random().toString(36).substring(2, 9).toUpperCase(),\n    workflowId: $workflow.id,\n    workflowName: $workflow.name,\n    failedNodeName: lastNode.name || \"HTTP_FlakyPaymentGateway\",\n    errorMessage: execution.error?.message || \"504 Gateway Timeout: Upstream provider latency exceeded SLA\",\n    httpStatusCode: statusCode,\n    isTransientFault: isTransient,\n    recoveryCategory: isTransient ? \"AUTOMATED_REPLAY\" : \"MANUAL_INVESTIGATION\",\n    stagedPayload: failedItem,\n    capturedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "e9a10001-0005-4000-8000-000000000005",
+      "name": "Code_ExtractDiagnostics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nstaticData.dlqRecords = staticData.dlqRecords || [];\nconst incident = $input.item.json;\n\nconst dlqEntry = {\n  dlqId: \"DLQ-\" + Date.now(),\n  incidentId: incident.incidentId,\n  failedNode: incident.failedNodeName,\n  payload: incident.stagedPayload,\n  error: incident.errorMessage,\n  status: \"QUEUED_IN_DLQ\",\n  replayCount: 0,\n  timestamp: new Date().toISOString()\n};\nstaticData.dlqRecords.push(dlqEntry);\n\nreturn {\n  json: {\n    ...incident,\n    dlqId: dlqEntry.dlqId,\n    dlqStored: true\n  }\n};"
+      },
+      "id": "e9a10001-0006-4000-8000-000000000006",
+      "name": "Code_PersistToDLQ",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.recoveryCategory }}",
+                    "rightValue": "AUTOMATED_REPLAY",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.recoveryCategory }}",
+                    "rightValue": "MANUAL_INVESTIGATION",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        }
+      },
+      "id": "e9a10001-0007-4000-8000-000000000007",
+      "name": "Switch_ClassifyRecovery",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        920,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const incident = $input.item.json;\nreturn {\n  json: {\n    recoveryAction: \"REPLAY_DISPATCHED\",\n    dlqId: incident.dlqId,\n    incidentId: incident.incidentId,\n    replayEndpoint: \"https://dummyjson.com/c/mock-payment-replay\",\n    scheduledDelaySeconds: 5,\n    replayedPayload: incident.stagedPayload,\n    replayedAt: new Date().toISOString()\n  }\n};"
+      },
+      "id": "e9a10001-0008-4000-8000-000000000008",
+      "name": "Code_ScheduleReplay",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const incident = $input.item.json;\nreturn {\n  json: {\n    recoveryAction: \"PERMANENT_INCIDENT_ESCALATED\",\n    dlqId: incident.dlqId,\n    incidentId: incident.incidentId,\n    priority: \"P1_URGENT\",\n    targetChannel: \"#sre-escalations\",\n    recommendation: \"Permanent schema or credential fault: Do not retry automatically.\",\n    escalatedAt: new Date().toISOString()\n  }\n};"
+      },
+      "id": "e9a10001-0009-4000-8000-000000000009",
+      "name": "Code_EscalateIncident",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const resp = $input.item.json;\nreturn {\n  json: {\n    auditStatus: \"INCIDENT_INTERCEPTED_AND_QUARANTINED\",\n    recoveryAction: resp.recoveryAction || \"ESCALATED\",\n    dlqReference: resp.dlqId || \"N/A\",\n    systemState: \"HEALTHY_FAILSAFE_ENGAGED\",\n    completedAt: new Date().toISOString()\n  }\n};"
+      },
+      "id": "e9a10001-0010-4000-8000-000000000010",
+      "name": "Code_RecoveryAudit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        480
+      ]
+    }
+  ],
+  "pinData": {
+    "Code_SimulateFailingOrder": [
+      {
+        "json": {
+          "transactionId": "TX-CRASH-801",
+          "customerEmail": "vip-client@enterprise.org",
+          "amount": 1450.00,
+          "simulateFault": "GATEWAY_TIMEOUT_504",
+          "statusCode": 504
+        }
+      }
+    ],
+    "Error_Trigger": [
+      {
+        "json": {
+          "execution": {
+            "id": "exec_894102",
+            "mode": "manual",
+            "error": {
+              "message": "504 Gateway Timeout: Upstream provider latency exceeded SLA",
+              "node": {
+                "name": "HTTP_FlakyPaymentGateway"
+              },
+              "statusCode": 504
+            }
+          }
+        }
+      }
+    ],
+    "Code_ExtractDiagnostics": [
+      {
+        "json": {
+          "incidentId": "INC-79A81F",
+          "workflowId": "Topic_13_Error_Handling",
+          "workflowName": "Topic 13 - Error Handling, Retries & Recovery Strategies",
+          "failedNodeName": "HTTP_FlakyPaymentGateway",
+          "errorMessage": "504 Gateway Timeout: Upstream provider latency exceeded SLA",
+          "httpStatusCode": 504,
+          "isTransientFault": true,
+          "recoveryCategory": "AUTOMATED_REPLAY",
+          "stagedPayload": {
+            "transactionId": "TX-CRASH-801",
+            "customerEmail": "vip-client@enterprise.org",
+            "amount": 1450.00
+          },
+          "capturedAt": "2026-11-06T08:30:00.000Z"
+        }
+      }
+    ],
+    "Code_PersistToDLQ": [
+      {
+        "json": {
+          "incidentId": "INC-79A81F",
+          "workflowId": "Topic_13_Error_Handling",
+          "workflowName": "Topic 13 - Error Handling, Retries & Recovery Strategies",
+          "failedNodeName": "HTTP_FlakyPaymentGateway",
+          "errorMessage": "504 Gateway Timeout: Upstream provider latency exceeded SLA",
+          "httpStatusCode": 504,
+          "isTransientFault": true,
+          "recoveryCategory": "AUTOMATED_REPLAY",
+          "stagedPayload": {
+            "transactionId": "TX-CRASH-801",
+            "customerEmail": "vip-client@enterprise.org",
+            "amount": 1450.00
+          },
+          "capturedAt": "2026-11-06T08:30:00.000Z",
+          "dlqId": "DLQ-1730881800000",
+          "dlqStored": true
+        }
+      }
+    ],
+    "Code_ScheduleReplay": [
+      {
+        "json": {
+          "recoveryAction": "REPLAY_DISPATCHED",
+          "dlqId": "DLQ-1730881800000",
+          "incidentId": "INC-79A81F",
+          "replayEndpoint": "https://dummyjson.com/c/mock-payment-replay",
+          "scheduledDelaySeconds": 5,
+          "replayedPayload": {
+            "transactionId": "TX-CRASH-801",
+            "customerEmail": "vip-client@enterprise.org",
+            "amount": 1450.00
+          },
+          "replayedAt": "2026-11-06T08:30:01.000Z"
+        }
+      }
+    ],
+    "Code_RecoveryAudit": [
+      {
+        "json": {
+          "auditStatus": "INCIDENT_INTERCEPTED_AND_QUARANTINED",
+          "recoveryAction": "REPLAY_DISPATCHED",
+          "dlqReference": "DLQ-1730881800000",
+          "systemState": "HEALTHY_FAILSAFE_ENGAGED",
+          "completedAt": "2026-11-06T08:30:02.000Z"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Manual_Trigger": {
+      "main": [
+        [
+          {
+            "node": "Code_SimulateFailingOrder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_SimulateFailingOrder": {
+      "main": [
+        [
+          {
+            "node": "HTTP_FlakyPaymentGateway",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error_Trigger": {
+      "main": [
+        [
+          {
+            "node": "Code_ExtractDiagnostics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_ExtractDiagnostics": {
+      "main": [
+        [
+          {
+            "node": "Code_PersistToDLQ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_PersistToDLQ": {
+      "main": [
+        [
+          {
+            "node": "Switch_ClassifyRecovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch_ClassifyRecovery": {
+      "main": [
+        [
+          {
+            "node": "Code_ScheduleReplay",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code_EscalateIncident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_ScheduleReplay": {
+      "main": [
+        [
+          {
+            "node": "Code_RecoveryAudit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_EscalateIncident": {
+      "main": [
+        [
+          {
+            "node": "Code_RecoveryAudit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "f9d0e1f2-1313-4c1e-9913-errorrecoverydlqpipeline",
+  "meta": {
+    "instanceId": "tayana-enterprise-n8n-level-2-topic-13"
+  },
+  "id": "Topic_13_Error_Handling_Retries_Recovery",
+  "tags": [
+    {
+      "name": "Level-2-Intermediate",
+      "id": "lvl2"
+    },
+    {
+      "name": "Error-Handling",
+      "id": "error-handling"
+    },
+    {
+      "name": "Dead-Letter-Queue",
+      "id": "dead-letter-queue"
+    },
+    {
+      "name": "Self-Healing-Replay",
+      "id": "self-healing-replay"
+    }
+  ]
+}
